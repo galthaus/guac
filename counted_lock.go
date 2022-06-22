@@ -15,15 +15,15 @@ type CountedLock struct {
 func (r *CountedLock) Lock() {
 	atomic.AddInt32(&r.numLocks, 1)
 	r.core.Lock()
+	atomic.AddInt32(&r.numLocks, -1)
 }
 
 // Unlock unlocks the mutex
 func (r *CountedLock) Unlock() {
-	atomic.AddInt32(&r.numLocks, -1)
 	r.core.Unlock()
 }
 
 // HasQueued returns true if a goroutine is waiting on the lock
 func (r *CountedLock) HasQueued() bool {
-	return atomic.LoadInt32(&r.numLocks) > 1
+	return atomic.LoadInt32(&r.numLocks) > 0
 }

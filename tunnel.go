@@ -2,8 +2,9 @@ package guac
 
 import (
 	"fmt"
-	"github.com/google/uuid"
 	"io"
+
+	"github.com/google/uuid"
 )
 
 // The Guacamole protocol instruction Opcode reserved for arbitrary
@@ -47,6 +48,10 @@ type Tunnel interface {
 	ConnectionID() string
 	// Close closes the tunnel
 	Close() error
+	// Info returns addtional data about the tunnel
+	Info() string
+	// SetInfo sets the info field
+	SetInfo(string)
 }
 
 // Base Tunnel implementation which synchronizes access to the underlying reader and writer with locks
@@ -60,6 +65,7 @@ type SimpleTunnel struct {
 	uuid       uuid.UUID
 	readerLock CountedLock
 	writerLock CountedLock
+	info       string
 }
 
 // NewSimpleTunnel creates a new tunnel
@@ -115,4 +121,14 @@ func (t *SimpleTunnel) Close() (err error) {
 // GetUUID returns the tunnel's UUID
 func (t *SimpleTunnel) GetUUID() string {
 	return t.uuid.String()
+}
+
+// Info returns the string
+func (t *SimpleTunnel) Info() string {
+	return t.info
+}
+
+// SetInfo sets the info string
+func (t *SimpleTunnel) SetInfo(i string) {
+	t.info = i
 }

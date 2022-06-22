@@ -2,10 +2,12 @@ package guac
 
 import (
 	"fmt"
-	logger "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/gin-gonic/gin"
+	"gitlab.com/rackn/logger"
 )
 
 const (
@@ -18,13 +20,15 @@ const (
 
 // Server uses HTTP requests to talk to guacd (as opposed to WebSockets in ws_server.go)
 type Server struct {
+	logger  logger.Logger
 	tunnels *TunnelMap
-	connect func(*http.Request) (Tunnel, error)
+	connect func(*gin.Context) (Tunnel, error)
 }
 
 // NewServer constructor
-func NewServer(connect func(r *http.Request) (Tunnel, error)) *Server {
+func NewServer(l logger.Logger, connect func(*gin.Context) (Tunnel, error)) *Server {
 	return &Server{
+		logger:  l,
 		tunnels: NewTunnelMap(),
 		connect: connect,
 	}
@@ -33,13 +37,13 @@ func NewServer(connect func(r *http.Request) (Tunnel, error)) *Server {
 // Registers the given tunnel such that future read/write requests to that tunnel will be properly directed.
 func (s *Server) registerTunnel(tunnel Tunnel) {
 	s.tunnels.Put(tunnel.GetUUID(), tunnel)
-	logger.Debugf("Registered tunnel %v.", tunnel.GetUUID())
+	s.logger.Debugf("Registered tunnel %v.", tunnel.GetUUID())
 }
 
 // Deregisters the given tunnel such that future read/write requests to that tunnel will be rejected.
 func (s *Server) deregisterTunnel(tunnel Tunnel) {
 	s.tunnels.Remove(tunnel.GetUUID())
-	logger.Debugf("Deregistered tunnel %v.", tunnel.GetUUID())
+	s.logger.Debugf("Deregistered tunnel %v.", tunnel.GetUUID())
 }
 
 // Returns the tunnel with the given UUID.
@@ -59,57 +63,65 @@ func (s *Server) sendError(response http.ResponseWriter, guacStatus Status, mess
 	response.WriteHeader(guacStatus.GetHTTPStatusCode())
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	err := s.handleTunnelRequestCore(w, r)
+func (s *Server) ServeHTTP(c *gin.Context) {
+	err := s.handleTunnelRequestCore(c)
 	if err == nil {
 		return
 	}
 	guacErr := err.(*ErrGuac)
 	switch guacErr.Kind {
 	case ErrClient:
-		logger.Warn("HTTP tunnel request rejected: ", err.Error())
-		s.sendError(w, guacErr.Status, err.Error())
+		s.logger.Warnf("HTTP tunnel request rejected: %v", err.Error())
+		s.sendError(c.Writer, guacErr.Status, err.Error())
 	default:
-		logger.Error("HTTP tunnel request failed: ", err.Error())
-		logger.Debug("Internal error in HTTP tunnel.", err)
-		s.sendError(w, guacErr.Status, "Internal server error.")
+		s.logger.Errorf("HTTP tunnel request failed: %v", err.Error())
+		s.logger.Debugf("Internal error in HTTP tunnel: %v", err)
+		s.sendError(c.Writer, guacErr.Status, "Internal server error.")
 	}
 	return
 }
 
-func (s *Server) handleTunnelRequestCore(response http.ResponseWriter, request *http.Request) (err error) {
+func (s *Server) handleTunnelRequestCore(c *gin.Context) (err error) {
+	request := c.Request
+	response := c.Writer
+
 	query := request.URL.RawQuery
 	if len(query) == 0 {
 		return ErrClient.NewError("No query string provided.")
 	}
 
+	s.logger.Debugf("httptunnel: received: %s", query)
+
 	// Call the supplied connect callback upon HTTP connect request
 	if query == "connect" {
-		tunnel, e := s.connect(request)
+		s.logger.Debugf("httptunnel: Connecting to tunnel")
+		tunnel, e := s.connect(c)
 		if e != nil {
 			err = ErrResourceNotFound.NewError("No tunnel created.", e.Error())
 			return
 		}
+		s.logger.Debugf("httptunnel: Connected to tunnel")
 
 		s.registerTunnel(tunnel)
 
 		// Ensure buggy browsers do not cache response
 		response.Header().Set("Cache-Control", "no-cache")
+		response.Header().Set("Guacamole-Tunnel-Token", tunnel.GetUUID())
 
-		_, e = response.Write([]byte(tunnel.GetUUID()))
-
-		if e != nil {
+		if _, e := response.Write([]byte(tunnel.GetUUID())); e != nil {
 			err = ErrServer.NewError(e.Error())
 			return
 		}
+
+		s.logger.Debugf("httptunnel: write to client")
 		return
 	}
 
 	// Connect has already been called so we use the UUID to do read and writes to the existing session
 	if strings.HasPrefix(query, readPrefix) && len(query) >= readPrefixLength+uuidLength {
-		err = s.doRead(response, request, query[readPrefixLength:readPrefixLength+uuidLength])
+		err = s.doRead(c, query[readPrefixLength:readPrefixLength+uuidLength])
 	} else if strings.HasPrefix(query, writePrefix) && len(query) >= writePrefixLength+uuidLength {
-		err = s.doWrite(response, request, query[writePrefixLength:writePrefixLength+uuidLength])
+		err = s.doWrite(c, query[writePrefixLength:writePrefixLength+uuidLength])
 	} else {
 		err = ErrClient.NewError("Invalid tunnel operation: " + query)
 	}
@@ -118,7 +130,7 @@ func (s *Server) handleTunnelRequestCore(response http.ResponseWriter, request *
 }
 
 // doRead takes guacd messages and sends them in the response
-func (s *Server) doRead(response http.ResponseWriter, request *http.Request, tunnelUUID string) error {
+func (s *Server) doRead(c *gin.Context, tunnelUUID string) error {
 	tunnel, err := s.getTunnel(tunnelUUID)
 	if err != nil {
 		return err
@@ -127,21 +139,23 @@ func (s *Server) doRead(response http.ResponseWriter, request *http.Request, tun
 	reader := tunnel.AcquireReader()
 	defer tunnel.ReleaseReader()
 
+	response := c.Writer
+
 	// Note that although we are sending text, Webkit browsers will
 	// buffer 1024 bytes before starting a normal stream if we use
 	// anything but application/octet-stream.
 	response.Header().Set("Content-Type", "application/octet-stream")
 	response.Header().Set("Cache-Control", "no-cache")
+	response.Header().Set("Guacamole-Tunnel-Token", tunnel.GetUUID())
 
 	if v, ok := response.(http.Flusher); ok {
 		v.Flush()
 	}
 
 	err = s.writeSome(response, reader, tunnel)
-
 	if err == nil {
 		// success
-		return err
+		return nil
 	}
 
 	switch err.(*ErrGuac).Kind {
@@ -156,7 +170,7 @@ func (s *Server) doRead(response http.ResponseWriter, request *http.Request, tun
 			v.Flush()
 		}
 	default:
-		logger.Debugln("Error writing to output", err)
+		s.logger.Debugf("Error writing to output: %v", err)
 		s.deregisterTunnel(tunnel)
 		tunnel.Close()
 	}
@@ -199,8 +213,8 @@ func (s *Server) writeSome(response http.ResponseWriter, guacd InstructionReader
 	}
 
 	// End-of-instructions marker
-	if _, err = response.Write([]byte("0.;")); err != nil {
-		return err
+	if _, e := response.Write([]byte("0.;")); e != nil {
+		return ErrOther.NewError(e.Error())
 	}
 	if v, ok := response.(http.Flusher); ok {
 		v.Flush()
@@ -209,7 +223,7 @@ func (s *Server) writeSome(response http.ResponseWriter, guacd InstructionReader
 }
 
 // doWrite takes data from the request and sends it to guacd
-func (s *Server) doWrite(response http.ResponseWriter, request *http.Request, tunnelUUID string) error {
+func (s *Server) doWrite(c *gin.Context, tunnelUUID string) error {
 	tunnel, err := s.getTunnel(tunnelUUID)
 	if err != nil {
 		return err
@@ -219,21 +233,24 @@ func (s *Server) doWrite(response http.ResponseWriter, request *http.Request, tu
 	// text/html, as such a content type would cause some browsers to
 	// attempt to parse the result, even though the JavaScript client
 	// does not explicitly request such parsing.
-	response.Header().Set("Content-Type", "application/octet-stream")
-	response.Header().Set("Cache-Control", "no-cache")
-	response.Header().Set("Content-Length", "0")
+	c.Writer.Header().Set("Content-Type", "application/octet-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Guacamole-Tunnel-Token", tunnel.GetUUID())
+	c.Writer.Header().Set("Content-Length", "0")
 
 	writer := tunnel.AcquireWriter()
 	defer tunnel.ReleaseWriter()
 
-	_, err = io.Copy(writer, request.Body)
-
+	_, err = io.Copy(writer, c.Request.Body)
 	if err != nil {
+		err = ErrOther.NewError(err.Error())
 		s.deregisterTunnel(tunnel)
-		if err = tunnel.Close(); err != nil {
-			logger.Debug("Error closing tunnel")
+		if ec := tunnel.Close(); ec != nil {
+			s.logger.Debugf("Error closing tunnel: %v", ec)
 		}
 	}
+
+	// GREG: Does this need to close c.Request.Body
 
 	return err
 }
